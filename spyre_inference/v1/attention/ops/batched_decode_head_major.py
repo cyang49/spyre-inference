@@ -83,13 +83,17 @@ def _batched_decode_kv_major_kernel(
                 v_page = v_pages[kv_page_ids].squeeze(1).reshape(
                     entries, num_kv_heads, block_size, head_size
                 )
-            scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
-            mask_tile = mask_by_chunk[c].reshape(entries, num_kv_heads, 1, block_size)
-            if logits_soft_cap > 0.0:
-                scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
-            sc = (scores + mask_tile).reshape(
+            # Reshape before score ops so reductions retain compatible seq/block ownership.
+            scores = torch.matmul(q, k_page.transpose(-2, -1)).reshape(
                 num_seqs, blocks_per_chunk, num_kv_heads, num_queries_per_kv, block_size
             )
+            mask_tile = mask_by_chunk[c].reshape(
+                num_seqs, blocks_per_chunk, num_kv_heads, 1, block_size
+            )
+            scores = scores * scale
+            if logits_soft_cap > 0.0:
+                scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
+            sc = scores + mask_tile
             chunk_max = torch.amax(torch.amax(sc, dim=-1, keepdim=True), dim=1, keepdim=True)
             new_max = chunk_max if c == 0 else torch.maximum(tile_max, chunk_max)
             probs = torch.exp(sc - new_max)
