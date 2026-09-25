@@ -52,17 +52,9 @@ def paged_attention(
     mask = mask_by_entry.view(entries, KV_LEN)
     scores = torch.matmul(q, k.transpose(-2, -1)) * scale
     probs = torch.softmax(scores + mask.unsqueeze(1), dim=-1)
-    page_probs = (
-        probs.view(entries, NUM_QUERIES_PER_KV, NUM_KV_BLOCKS, BLOCK_SIZE)
-        .permute(0, 2, 1, 3)
-        .reshape(entries * NUM_KV_BLOCKS, NUM_QUERIES_PER_KV, BLOCK_SIZE)
-    )
-    page_v = v.view(entries * NUM_KV_BLOCKS, BLOCK_SIZE, HEAD_SIZE)
-    out = (
-        torch.matmul(page_probs, page_v)
-        .view(entries, NUM_KV_BLOCKS, NUM_QUERIES_PER_KV, HEAD_SIZE)
-        .sum(dim=1)
-    )
+    # Direct full-KV PV BMM currently fails in the Deeptools scheduler for
+    # qlen=8, kvlen=1024: out_reuse_dim.size() == 1.
+    out = torch.matmul(probs, v)
     return (
         out.view(NUM_KV_HEADS, NUM_Q_TOKENS, NUM_QUERIES_PER_KV, HEAD_SIZE)
         .permute(1, 0, 2, 3)
