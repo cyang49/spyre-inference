@@ -50,7 +50,10 @@ def paged_attention(
     k = k_pages.index_select(0, page_index).view(entries, KV_LEN, HEAD_SIZE)
     v = v_pages.index_select(0, page_index).view(entries, KV_LEN, HEAD_SIZE)
     mask = mask_by_entry.view(entries, KV_LEN)
-    scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+    # Materialize K's transposed layout before the score BMM so its restickified
+    # form keeps a direct LX ownership mapping from gather through consumption.
+    k = k.transpose(-2, -1) * 1.0
+    scores = torch.matmul(q, k) * scale
     probs = torch.softmax(scores + mask.unsqueeze(1), dim=-1)
     page_probs = (
         probs.view(entries, NUM_QUERIES_PER_KV, NUM_KV_BLOCKS, BLOCK_SIZE)
