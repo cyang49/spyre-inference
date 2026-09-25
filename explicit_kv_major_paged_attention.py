@@ -15,6 +15,8 @@
 
 """Repro: KV-major paged attention with exact flattened softmax."""
 
+import argparse
+
 import torch
 import torch.nn.functional as F
 from torch.profiler import ProfilerActivity, profile
@@ -40,7 +42,7 @@ def paged_attention(
     k_pages,
     v_pages,
     page_index,
-    mask_by_query,
+    mask_by_entry,
     scale,
 ):
     entries = NUM_KV_HEADS * NUM_Q_TOKENS
@@ -49,9 +51,7 @@ def paged_attention(
     )
     k = k_pages.index_select(0, page_index).view(entries, KV_LEN, HEAD_SIZE)
     v = v_pages.index_select(0, page_index).view(entries, KV_LEN, HEAD_SIZE)
-    mask = mask_by_query.unsqueeze(0).expand(NUM_KV_HEADS, -1, -1).reshape(
-        entries, KV_LEN
-    )
+    mask = mask_by_entry.view(entries, KV_LEN)
     scores = torch.matmul(q, k.transpose(-2, -1)) * scale
     probs = torch.softmax(scores + mask.unsqueeze(1), dim=-1)
     page_probs = probs.view(
@@ -76,7 +76,7 @@ def sdpa_reference(
     k_pages,
     v_pages,
     page_index,
-    mask_by_query,
+    mask_by_entry,
     scale,
 ):
     entries = NUM_KV_HEADS * NUM_Q_TOKENS
@@ -85,9 +85,7 @@ def sdpa_reference(
     )
     k = k_pages.index_select(0, page_index).view(entries, KV_LEN, HEAD_SIZE)
     v = v_pages.index_select(0, page_index).view(entries, KV_LEN, HEAD_SIZE)
-    mask = mask_by_query.unsqueeze(0).expand(NUM_KV_HEADS, -1, -1).reshape(
-        entries, KV_LEN
-    )
+    mask = mask_by_entry.view(entries, KV_LEN)
     out = F.scaled_dot_product_attention(
         q.unsqueeze(2),
         k.unsqueeze(1).expand(-1, NUM_QUERIES_PER_KV, -1, -1),
@@ -102,6 +100,22 @@ def sdpa_reference(
 
 
 def main():
+    global NUM_Q_TOKENS, NUM_KV_BLOCKS, KV_LEN, PROFILE_REPS
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--qlen", type=int, default=NUM_Q_TOKENS)
+    parser.add_argument("--kvlen", type=int, default=KV_LEN)
+    parser.add_argument("--profile-reps", type=int, default=PROFILE_REPS)
+    args = parser.parse_args()
+    if args.qlen <= 0 or args.qlen & (args.qlen - 1):
+        parser.error("--qlen must be a positive power of two")
+    if args.kvlen < BLOCK_SIZE or args.kvlen & (args.kvlen - 1):
+        parser.error(f"--kvlen must be a power of two >= {BLOCK_SIZE}")
+
+    NUM_Q_TOKENS = args.qlen
+    NUM_KV_BLOCKS = args.kvlen // BLOCK_SIZE
+    KV_LEN = args.kvlen
+    PROFILE_REPS = args.profile_reps
     torch.manual_seed(0)
     page_ids = torch.randint(
         NUM_BLOCKS_TOTAL, (NUM_Q_TOKENS, NUM_KV_BLOCKS), dtype=torch.int32
@@ -152,14 +166,28 @@ def main():
         * NUM_STAGING_TOKENS
         + torch.arange(NUM_Q_TOKENS, dtype=torch.int32)[None, :]
     ).reshape(-1)
-    kv_lens = torch.tensor(
-        [KV_LEN - i * BLOCK_SIZE for i in range(NUM_Q_TOKENS)], dtype=torch.int32
-    )
+    kv_lens = torch.full((NUM_Q_TOKENS,), KV_LEN, dtype=torch.int32)
     mask_by_query = torch.where(
         torch.arange(KV_LEN)[None, :] < kv_lens[:, None],
         0.0,
         float("-inf"),
     ).to(torch.float16)
+    mask_by_entry = (
+        mask_by_query.unsqueeze(0)
+        .expand(NUM_KV_HEADS, -1, -1)
+        .reshape(NUM_KV_HEADS * NUM_Q_TOKENS, NUM_KV_BLOCKS, BLOCK_SIZE)
+        .contiguous()
+    )
+    mask_layout = SpyreTensorLayout(
+        [
+            NUM_KV_HEADS * NUM_Q_TOKENS,
+            NUM_KV_BLOCKS,
+            BLOCK_SIZE // 64,
+            64,
+        ],
+        [NUM_KV_BLOCKS * BLOCK_SIZE, BLOCK_SIZE, 64, 1],
+        get_device_dtype(mask_by_entry.dtype),
+    )
     scale = torch.tensor(HEAD_SIZE**-0.5, dtype=torch.float16)
 
     expected = paged_attention(
@@ -168,7 +196,7 @@ def main():
         k_host,
         v_host,
         page_index,
-        mask_by_query,
+        mask_by_entry,
         scale,
     )
     reference = sdpa_reference(
@@ -177,7 +205,7 @@ def main():
         k_host,
         v_host,
         page_index,
-        mask_by_query,
+        mask_by_entry,
         scale,
     )
     torch.testing.assert_close(expected, reference, rtol=0.1, atol=0.1)
@@ -187,7 +215,7 @@ def main():
         k_host.to("spyre", device_layout=kv_layout),
         v_host.to("spyre", device_layout=kv_layout),
         page_index.to("spyre"),
-        mask_by_query.to("spyre"),
+        mask_by_entry.to("spyre", device_layout=mask_layout),
         scale.to("spyre"),
     )
     compiled_paged_attention = torch.compile(paged_attention, dynamic=False)
@@ -211,6 +239,11 @@ def main():
     print(
         f"device kernel time: {kernel_us:.3f} us total, "
         f"{kernel_us / PROFILE_REPS:.3f} us/run ({PROFILE_REPS} runs)"
+    )
+    print(
+        f"RESULT qlen={NUM_Q_TOKENS} kvlen={KV_LEN} reps={PROFILE_REPS} "
+        f"kernel_us_total={kernel_us:.3f} "
+        f"kernel_us_per_run={kernel_us / PROFILE_REPS:.3f}"
     )
 
 
