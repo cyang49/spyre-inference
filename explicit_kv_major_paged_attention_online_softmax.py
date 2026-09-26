@@ -62,9 +62,7 @@ def paged_attention(
             entries, BLOCKS_PER_CHUNK * BLOCK_SIZE, HEAD_SIZE
         )
         v_chunk = v_pages.index_select(0, page_ids)
-        # Materialize K's transposed layout before each chunk score BMM so its
-        # restickified form keeps a direct LX ownership mapping to consumption.
-        k_chunk = k_chunk.transpose(-2, -1) * 1.0
+        k_chunk = k_chunk.transpose(-2, -1)
         scores = torch.matmul(q, k_chunk) * scale
         mask = mask_rows.permute(1, 0, 2).reshape(entries, BLOCKS_PER_CHUNK * BLOCK_SIZE)
         scores = torch.clamp(scores + mask.unsqueeze(1), min=torch.finfo(scores.dtype).min)
