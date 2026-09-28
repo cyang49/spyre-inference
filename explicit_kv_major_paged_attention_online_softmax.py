@@ -169,25 +169,34 @@ def sdpa_reference(
 
 
 def main():
-    global NUM_Q_TOKENS, NUM_KV_BLOCKS, KV_LEN, PROFILE_REPS
+    global NUM_Q_TOKENS, NUM_KV_BLOCKS, BLOCKS_PER_CHUNK, KV_LEN, PROFILE_REPS
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--qlen", type=int, default=NUM_Q_TOKENS)
     parser.add_argument("--kvlen", type=int, default=KV_LEN)
     parser.add_argument("--profile-reps", type=int, default=PROFILE_REPS)
-    parser.add_argument("--blocks-per-chunk", type=int, default=BLOCKS_PER_CHUNK)
+    parser.add_argument("--blocks-per-chunk", type=int)
     args = parser.parse_args()
     if args.qlen <= 0 or args.qlen & (args.qlen - 1):
         parser.error("--qlen must be a positive power of two")
     if args.kvlen < BLOCK_SIZE or args.kvlen & (args.kvlen - 1):
         parser.error(f"--kvlen must be a power of two >= {BLOCK_SIZE}")
-    if args.blocks_per_chunk != BLOCKS_PER_CHUNK:
-        parser.error(f"--blocks-per-chunk is currently fixed at {BLOCKS_PER_CHUNK}")
-    if args.kvlen // BLOCK_SIZE % BLOCKS_PER_CHUNK:
-        parser.error(f"--kvlen must contain a multiple of {BLOCKS_PER_CHUNK} pages")
+    num_blocks = args.kvlen // BLOCK_SIZE
+    blocks_per_chunk = (
+        min(BLOCKS_PER_CHUNK, num_blocks)
+        if args.blocks_per_chunk is None
+        else args.blocks_per_chunk
+    )
+    if (
+        blocks_per_chunk <= 0
+        or blocks_per_chunk & (blocks_per_chunk - 1)
+        or num_blocks % blocks_per_chunk
+    ):
+        parser.error("--blocks-per-chunk must be a power of two dividing the page count")
 
     NUM_Q_TOKENS = args.qlen
-    NUM_KV_BLOCKS = args.kvlen // BLOCK_SIZE
+    NUM_KV_BLOCKS = num_blocks
+    BLOCKS_PER_CHUNK = blocks_per_chunk
     KV_LEN = args.kvlen
     PROFILE_REPS = args.profile_reps
     torch.manual_seed(0)
