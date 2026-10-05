@@ -48,7 +48,10 @@ if TYPE_CHECKING:
         spyre_moe_route_dtype: torch.dtype
         spyre_moe_gate: torch.Tensor
         spyre_moe_up: torch.Tensor
+        spyre_moe_gate_alias: torch.Tensor
+        spyre_moe_up_alias: torch.Tensor
         spyre_moe_down: torch.Tensor
+        spyre_moe_down_persistent: torch.Tensor
         spyre_moe_route_identity: torch.Tensor
 
 
@@ -56,6 +59,8 @@ logger = init_logger(__name__)
 
 _MOE_COMPILER_CONFIG = {"frontend_pool_allocation": True}
 _PERSISTENT_COMPILER_CONFIG = {"allow_all_ops_in_lx_planning": True}
+
+_MOE_CHUNKS = 4
 
 
 @dataclass(frozen=True)
@@ -183,13 +188,6 @@ def _routing_weights(
     return weights, indices
 
 
-def _gather_indices(indices: torch.Tensor, top_k: int, stick: int) -> torch.Tensor:
-    tokens = indices.shape[0]
-    widened = indices[..., None].expand(tokens, top_k, stick).contiguous()
-    address = widened.to(torch.float32)[..., : stick // 2].to(torch.int32)
-    return address[..., 0]
-
-
 def _activation(x: torch.Tensor, up: torch.Tensor, activation: str) -> torch.Tensor:
     if activation == "gelu_tanh":
         return F.gelu(x, approximate="tanh") * up
@@ -209,15 +207,94 @@ def _moe_gathered(
     activation: str,
 ) -> torch.Tensor:
     tokens, hidden = x.shape
-    weights, indices = _routing_weights(router_logits, top_k, routing, reduce_dtype)
-    indices = _gather_indices(indices, top_k, stick)
-    rows, inter = tokens * top_k, gate.shape[-1]
-    inputs = x[:, None, :].expand(tokens, top_k, hidden).contiguous().reshape(rows, 1, hidden)
-    gate_out = torch.bmm(inputs, gate[indices].reshape(rows, hidden, inter))
-    up_out = torch.bmm(inputs, up[indices].reshape(rows, hidden, inter))
-    expert_out = torch.bmm(
-        _activation(gate_out, up_out, activation), down[indices].reshape(rows, inter, hidden)
-    ).reshape(tokens, top_k, hidden)
+    chunks = _MOE_CHUNKS
+    if hidden % chunks:
+        raise ValueError(
+            f"gathered MoE hidden size {hidden} must divide evenly into {chunks} chunks"
+        )
+    if gate.ndim != 3 or gate.shape[0] % chunks:
+        raise ValueError(
+            "gathered gate pool must have chunked [E*chunks, hidden/chunks, inter] shape"
+        )
+    slice_rows = hidden // chunks
+    experts = gate.shape[0] // chunks
+    inter = gate.shape[-1]
+    expected_gate_shape = (experts * chunks, slice_rows, inter)
+    if gate.shape != expected_gate_shape or up.shape != expected_gate_shape:
+        raise ValueError(
+            f"gathered gate/up pools must have shape {expected_gate_shape}, "
+            f"got gate={tuple(gate.shape)}, up={tuple(up.shape)}"
+        )
+    expected_down_shape = (experts * chunks, inter, slice_rows)
+    if down.shape != expected_down_shape:
+        raise ValueError(
+            f"gathered down pool must have chunked shape {expected_down_shape}, "
+            f"got {tuple(down.shape)}"
+        )
+    weights, raw_indices = _routing_weights(router_logits, top_k, routing, reduce_dtype)
+    rows = tokens * top_k
+    # Entry e*chunks + c on the [E*chunks, hidden/chunks, inter] alias of the
+    # whole-expert pool storage — expert-major, so each expert's chunk-slices
+    # are adjacent entries (same gather shape as the chunk-major layout,
+    # index values differ). Built per chunk as a scalar pointwise on the
+    # stick-wide fp32 cast of the routing indices; scalar immediates keep it
+    # single-operand — an in-graph arange falls back to CPU, and any
+    # tensor-operand offset add trips the mixed element-arrangement check
+    # against the staggered column-select provenance. cat along dim 0
+    # materializes the index in (chunk, row) order — a broadcast cross product
+    # flattened instead would put Mod(d0, chunks) in the gather's pool
+    # addressing, which the stick-expression checker rejects.
+    expert_fp32 = (
+        raw_indices.reshape(-1)[:, None].expand(rows, stick).contiguous().to(torch.float32)
+    )
+    entries = torch.cat([expert_fp32 * float(chunks) + float(c) for c in range(chunks)], dim=0)
+    slice_index = entries[..., : stick // 2].to(torch.int32)[:, 0]
+    # (chunk, row) batch order: chunk c's rows cover every expert of the step,
+    # so each chunk block of the x-operand repeats the token's chunk slice.
+    inputs = torch.cat(
+        [
+            x.reshape(tokens, 1, chunks, slice_rows)[:, :, c]
+            .reshape(tokens, 1, slice_rows)
+            .expand(tokens, top_k, slice_rows)
+            .reshape(rows, 1, slice_rows)
+            for c in range(chunks)
+        ],
+        dim=0,
+    )
+    # Stack-sequential: each stack's gather -> bmm -> fold completes before the
+    # next stack's gather runs, so the second stack's 32 slices reuse the
+    # first stack's freed LX buffers (both stacks' slices together exceed the
+    # per-core LX budget, so gathering both first parks one stack in HBM).
+    gate_out = (
+        torch.bmm(inputs, gate[slice_index].reshape(rows * chunks, slice_rows, inter))
+        .reshape(chunks, tokens, top_k, inter)
+        .permute(1, 2, 0, 3)
+        .sum(dim=2)
+        .reshape(rows, 1, inter)
+    )
+    up_out = (
+        torch.bmm(inputs, up[slice_index].reshape(rows * chunks, slice_rows, inter))
+        .reshape(chunks, tokens, top_k, inter)
+        .permute(1, 2, 0, 3)
+        .sum(dim=2)
+        .reshape(rows, 1, inter)
+    )
+    # Down re-pool: [E*chunks, inter, hidden/chunks] (output-axis chunks as
+    # pool entries, contraction inter kept whole). The activation is replicated
+    # per chunk (cat, (chunk, row) order) and the bmm reads the pool through
+    # the same flat index — the gather fuses into the batchmatmul (KERNEL
+    # operand), so the down stack never materializes in HBM. The output
+    # chunks cat back together per expert.
+    activated = _activation(gate_out, up_out, activation)
+    act_rep = torch.cat([activated.reshape(rows, 1, inter) for _ in range(chunks)], dim=0)
+    # Down pool is chunk-major (entry c*E + e), so its gather index is built
+    # separately from the expert-major gate/up entries.
+    entries_down = torch.cat([expert_fp32 + float(c * experts) for c in range(chunks)], dim=0)
+    slice_index_down = entries_down[..., : stick // 2].to(torch.int32)[:, 0]
+    parts = torch.bmm(
+        act_rep, down[slice_index_down].reshape(rows * chunks, inter, slice_rows)
+    ).reshape(chunks, tokens, top_k, slice_rows)
+    expert_out = torch.cat([parts[c] for c in range(chunks)], dim=-1)
     return (expert_out * weights[..., None]).sum(dim=1)
 
 
@@ -262,6 +339,7 @@ def _name_persistent_dims(
         name_tensor_dims,
     )
 
+    # Whole-expert pools [E, hidden, inter] / [E, inter, hidden].
     experts, hidden, inter = gate.shape
     for name, extent in (
         ("E", experts),
@@ -285,12 +363,19 @@ def _moe_persistent(
     down: torch.Tensor,
     activation: str,
 ) -> torch.Tensor:
+    # The prefill hinted whole-K form over whole-expert pools: the schedule
+    # needs both hint scopes (route named_dims + matmul E-tiles/T-work_div) to
+    # form WSR coarse-tile groups; either alone degrades to the slow schedule
+    # or fails grouping.
     from torch_spyre._inductor.propagate_hints import spyre_hint
 
     experts = gate.shape[0]
     with spyre_hint(named_dims=["E", "T", "ONE"]):
         route = route.permute(1, 0, 2).contiguous().clone()
-    with spyre_hint(num_tiles_per_dim={"E": experts}, work_div={"T": _token_cores(x.shape[0])}):
+    with spyre_hint(
+        num_tiles_per_dim={"E": experts},
+        work_div={"T": _token_cores(x.shape[0])},
+    ):
         h = x.unsqueeze(0)
         activated = _activation(torch.matmul(h, gate), torch.matmul(h, up), activation)
         return (torch.matmul(activated, down) * route).sum(dim=0)
@@ -301,8 +386,8 @@ def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
     return _moe_gathered(
         x,
         router_logits,
-        layer.spyre_moe_gate,
-        layer.spyre_moe_up,
+        layer.spyre_moe_gate_alias,
+        layer.spyre_moe_up_alias,
         layer.spyre_moe_down,
         layer.top_k,
         layer.spyre_moe_stick,
@@ -361,7 +446,7 @@ def _experts(layer: RoutedExperts, x: torch.Tensor, route: torch.Tensor) -> torc
         route,
         layer.spyre_moe_gate,
         layer.spyre_moe_up,
-        layer.spyre_moe_down,
+        layer.spyre_moe_down_persistent,
         layer.spyre_moe_recipe.activation,
     )
 
@@ -399,6 +484,33 @@ def _to_spyre_expert_weight(weight: torch.Tensor, pad: tuple[int, ...]) -> torch
     return moved
 
 
+def _chunk_pool_alias(pool: torch.Tensor, chunks: int) -> torch.Tensor:
+    """Reinterpret a whole-expert [E, contract, free] pool as [E*chunks, contract/chunks, free].
+
+    The same storage, registered with chunk-granular entries so the decode
+    gather spreads one [contract/chunks, free] slice per core (LX-resident).
+    Entry e*chunks + c; flat order is byte-identical to the whole-expert pool.
+    """
+    from torch_spyre import _C
+    from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+
+    experts, contract, free = pool.shape
+    eps = SpyreTensorLayout([experts, contract, free], pool.dtype).elems_per_stick()
+    c4 = contract // chunks
+    layout = SpyreTensorLayout(
+        [experts * chunks, c4, free // eps, eps],
+        [c4 * free, free, eps, 1],
+        get_device_dtype(pool.dtype),
+    )
+    return _C.reinterpret_tensor_with_layout(
+        pool,
+        [experts * chunks, c4, free],
+        [c4 * free, free, 1],
+        0,
+        layout,
+    )
+
+
 def _prepare_layer(layer: RoutedExperts) -> None:
     from torch_spyre._C import get_elem_in_stick
 
@@ -426,14 +538,40 @@ def _prepare_layer(layer: RoutedExperts) -> None:
             f"the {stick}-element stick; hidden_size must be stick-aligned."
         )
     pad = -inter % stick
+    # Dual-registration gate/up pools: one physical [E, hidden, inter] stack,
+    # DMA-registered whole-expert so the persistent (prefill) form runs
+    # whole-K matmuls with pool provenance. The decode gather consumes a
+    # reinterpret alias of the same storage — see ``_chunk_pool_alias``.
+    chunks = _MOE_CHUNKS
     layer.spyre_moe_gate = _to_spyre_expert_weight(w13[:, :inter, :].transpose(1, 2), (0, pad))
     layer.spyre_moe_up = _to_spyre_expert_weight(w13[:, inter:, :].transpose(1, 2), (0, pad))
+
+    layer.spyre_moe_gate_alias = _chunk_pool_alias(layer.spyre_moe_gate, chunks)
+    layer.spyre_moe_up_alias = _chunk_pool_alias(layer.spyre_moe_up, chunks)
     del layer.w13_weight, w13
     w2 = layer.get_parameter("w2_weight").data
     transform_down = layer.spyre_moe_recipe.prepare_down_weight
     if transform_down is not None:
         w2 = transform_down(w2)
-    layer.spyre_moe_down = _to_spyre_expert_weight(w2.transpose(1, 2), (0, 0, 0, pad))
+    # Persistent down pool: the whole-expert [E, inter, hidden] registration the
+    # prefill form runs its whole-K down matmul over. The decode pool is
+    # output-chunk re-laid, which permutes flat order, so the two cannot share
+    # storage (unlike gate/up).
+    layer.spyre_moe_down_persistent = _to_spyre_expert_weight(w2.transpose(1, 2), (0, 0, 0, pad))
+    # Down re-lay: one pool entry per (expert, output-chunk) slice —
+    # [E*chunks, inter, hidden/chunks], chunk-major — so the decode gather
+    # fuses into the consumer batchmatmul (KERNEL operand) instead of
+    # materializing the whole [rows, inter, hidden] expert stack in HBM.
+    w2 = w2.transpose(1, 2)
+    if pad:
+        w2 = F.pad(w2, (0, 0, 0, pad))
+    w2 = (
+        w2.reshape(experts, inter + pad, chunks, hidden // chunks)
+        .permute(2, 0, 1, 3)
+        .reshape(experts * chunks, inter + pad, hidden // chunks)
+        .contiguous()
+    )
+    layer.spyre_moe_down = _to_spyre_expert_weight(w2, (0, 0, 0, 0))
     del layer.w2_weight, w2
 
     dtype = layer.spyre_moe_gate.dtype
@@ -499,7 +637,9 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             else:
                 topk_probs = _region(layer, "topk_probs", _topk_probs)(router_logits, layer.top_k)
                 route = _region(layer, "route_selected", _route_selected)(layer, topk_probs)
-            _name_persistent_dims(x, layer.spyre_moe_gate, layer.spyre_moe_up, layer.spyre_moe_down)
+            _name_persistent_dims(
+                x, layer.spyre_moe_gate, layer.spyre_moe_up, layer.spyre_moe_down_persistent
+            )
             try:
                 with persistent_scope:
                     return _region(layer, "experts", _experts)(layer, x, route)
