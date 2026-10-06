@@ -307,7 +307,6 @@ The down stack is stored once in matmul-weight order. Its H-stick axis is split 
 expert-major decode chunks through a reinterpret view, so prefill and decode share the same
 device storage; no second down-weight pool is allocated.
 
-
 `latency_ms` is synchronized wall latency without an active Kineto profile.
 `profiled_cpu_span_ms` and device-event samples are collected separately.
 `profiled_device_events` keeps every profiled device event name and duration;
