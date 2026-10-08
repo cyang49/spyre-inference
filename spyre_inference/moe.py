@@ -535,7 +535,8 @@ def _check_pool_layout(pool: torch.Tensor, expected: SpyreTensorLayout) -> None:
 def _chunk_pool_alias(pool: torch.Tensor, chunks: int) -> torch.Tensor:
     """Expose a whole-expert [E, contract, free] pool as [E*chunks, contract/chunks, free].
 
-    The view shares storage; entry e*chunks+c selects chunk c of expert e.
+    The view shares storage; entry e*chunks+c selects chunk c of expert e. The contract axis
+    is outer to the free-dim sticks, so chunking it preserves flat physical order.
     """
     from torch_spyre import _C
     from torch_spyre._C import SpyreTensorLayout, get_device_dtype

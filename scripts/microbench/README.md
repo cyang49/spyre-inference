@@ -303,9 +303,10 @@ SPYRE_NUM_CPUS=8 uv run --no-sync python scripts/microbench/gemma4_decode_moe_mi
     --output /tmp/gemma4-decode-moe.json
 ```
 
-The down stack is stored once in matmul-weight order. Its H-stick axis is split into four
-expert-major decode chunks through a reinterpret view, so prefill and decode share the same
-device storage; no second down-weight pool is allocated.
+Gate, up, and down are each stored once. Decode reads four expert-major hidden slices of each
+through reinterpret views, so prefill and decode share the same device storage and no second
+weight pool is allocated; see
+[MoE expert weights](../../docs/architecture/index.md#moe-expert-weights).
 
 `latency_ms` is synchronized wall latency without an active Kineto profile.
 `profiled_cpu_span_ms` and device-event samples are collected separately.
