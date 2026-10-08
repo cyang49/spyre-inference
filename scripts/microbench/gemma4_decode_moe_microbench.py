@@ -62,18 +62,18 @@ def _device_layer(seed: int) -> tuple[SimpleNamespace, dict[str, torch.Tensor]]:
     gate_device = _to_spyre_expert_weight(gate, ())
     up_device = _to_spyre_expert_weight(up, ())
     # Keep one persistent down-weight allocation and expose decode chunks as a view.
-    down_persistent = _to_spyre_expert_weight(down, (), kernel_order=True)
+    down_device = _to_spyre_expert_weight(down, (), kernel_order=True)
     gate_alias = moe._chunk_pool_alias(gate_device, chunks)
     up_alias = moe._chunk_pool_alias(up_device, chunks)
-    down_decode = _down_chunk_pool_alias(down_persistent, chunks)
+    down_alias = _down_chunk_pool_alias(down_device, chunks)
 
     stick = get_elem_in_stick(DTYPE)
     layer = SimpleNamespace(
         spyre_moe_recipe=SpyreMoERecipe("gelu_tanh", "full_softmax"),
         spyre_moe_gate=gate_device,
         spyre_moe_up=up_device,
-        spyre_moe_down=down_decode,
-        spyre_moe_down_persistent=down_persistent,
+        spyre_moe_down=down_device,
+        spyre_moe_down_alias=down_alias,
         spyre_moe_gate_alias=gate_alias,
         spyre_moe_up_alias=up_alias,
         spyre_moe_stick=stick,
