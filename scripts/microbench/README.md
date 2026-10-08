@@ -303,9 +303,9 @@ SPYRE_NUM_CPUS=8 uv run --no-sync python scripts/microbench/gemma4_decode_moe_mi
     --output /tmp/gemma4-decode-moe.json
 ```
 
-Gate, up, and down are each stored once. Decode reads four expert-major hidden slices of each
-through reinterpret views, so prefill and decode share the same device storage and no second
-weight pool is allocated; see
+Gate, up, and down are each stored once. Decode reads `C` expert-major hidden slices of each
+through reinterpret views, where `C` is derived from the expert top-k, core count, stick
+alignment, and per-core weight budget; `SPYRE_MOE_CHUNKS` can override the selection. See
 [MoE expert weights](../../docs/architecture/index.md#moe-expert-weights).
 
 `latency_ms` is synchronized wall latency without an active Kineto profile.
