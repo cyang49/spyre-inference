@@ -185,8 +185,8 @@ def moe_weights(request):
         name: _to_spyre_expert_weight(stacks[name], (), kernel_order=False)
         for name in ("gate", "up")
     }
-    device["down_persistent"] = _to_spyre_expert_weight(stacks["down"], (), kernel_order=True)
-    device["down"] = _down_chunk_pool_alias(device["down_persistent"], chunks)
+    device["down"] = _to_spyre_expert_weight(stacks["down"], (), kernel_order=True)
+    device["down_alias"] = _down_chunk_pool_alias(device["down"], chunks)
     device["gate_alias"] = _chunk_pool_alias(device["gate"], chunks)
     device["up_alias"] = _chunk_pool_alias(device["up"], chunks)
     return host, device
@@ -497,7 +497,7 @@ def _dispatch_layer(routing):
         spyre_moe_gate=None,
         spyre_moe_up=None,
         spyre_moe_down=None,
-        spyre_moe_down_persistent=None,
+        spyre_moe_down_alias=None,
         # Divides both widths ``_apply`` builds, so these tests hit the token bound, not the guard.
         spyre_moe_stick=16,
         spyre_moe_route_dtype=torch.float16,
@@ -684,7 +684,7 @@ def test_gathered_matches_dense_reference(moe_weights):
             logits.to("spyre"),
             device["gate_alias"],
             device["up_alias"],
-            device["down"],
+            device["down_alias"],
             TOP_K,
             stick,
             logits.dtype,
@@ -743,9 +743,9 @@ def stick_aligned_moe_weights():
     device = {
         "gate": _to_spyre_expert_weight(host["gate"], ()),
         "up": _to_spyre_expert_weight(host["up"], ()),
-        "down_persistent": _to_spyre_expert_weight(host["down"], (), kernel_order=True),
+        "down": _to_spyre_expert_weight(host["down"], (), kernel_order=True),
     }
-    device["down"] = _down_chunk_pool_alias(device["down_persistent"], chunks)
+    device["down_alias"] = _down_chunk_pool_alias(device["down"], chunks)
     device["gate_alias"] = _chunk_pool_alias(device["gate"], chunks)
     device["up_alias"] = _chunk_pool_alias(device["up"], chunks)
     return host, device
@@ -776,6 +776,7 @@ def test_gathered_loop_matches_dense_reference(stick_aligned_moe_weights, num_to
         spyre_moe_gate=device["gate"],
         spyre_moe_up=device["up"],
         spyre_moe_down=device["down"],
+        spyre_moe_down_alias=device["down_alias"],
         spyre_moe_stick=get_elem_in_stick(torch.float16),
         # The transport dtype, so the routing softmax matches the reference exactly.
         spyre_moe_route_dtype=torch.float16,
@@ -846,7 +847,7 @@ def test_persistent_matches_dense_reference(moe_weights, num_tokens, routing_mar
 
     with spyre_config.patch({"frontend_pool_allocation": True}):
         route = routing(probs(logits.to("spyre"), logits.dtype), identity, TOP_K, stick)
-        _name_persistent_dims(x_dev, device["gate"], device["up"], device["down_persistent"])
+        _name_persistent_dims(x_dev, device["gate"], device["up"], device["down"])
         try:
             with spyre_config.patch({"allow_all_ops_in_lx_planning": True}):
                 actual = experts(
@@ -854,7 +855,7 @@ def test_persistent_matches_dense_reference(moe_weights, num_tokens, routing_mar
                     route,
                     device["gate"],
                     device["up"],
-                    device["down_persistent"],
+                    device["down"],
                     "gelu_tanh",
                 )
         finally:
@@ -982,19 +983,20 @@ class _RoutedExperts(torch.nn.Module):
         self.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
 
 
-def test_prepare_layer_rejects_an_unaligned_hidden_size_before_relayout():
+# Both fail the up-front check: one is not stick-aligned, the other splits into unaligned chunks.
+@pytest.mark.parametrize("hidden", [HIDDEN - 1, HIDDEN + 64], ids=["unaligned", "chunk_unaligned"])
+def test_prepare_layer_rejects_an_unchunkable_hidden_size_before_relayout(hidden):
     from torch_spyre._C import get_elem_in_stick
 
-    from spyre_inference.moe import SpyreMoERecipe, _prepare_layer
+    from spyre_inference.moe import _MOE_CHUNKS, SpyreMoERecipe, _prepare_layer
 
     stick = get_elem_in_stick(torch.float16)
-    hidden = HIDDEN - 1
     w13 = torch.empty(EXPERTS, 2 * INTER, hidden, dtype=torch.float16)
     w2 = torch.empty(EXPERTS, hidden, INTER, dtype=torch.float16)
     layer = _RoutedExperts(w13, w2)
     layer.spyre_moe_recipe = SpyreMoERecipe("gelu_tanh", "full_softmax")
 
-    match = rf"down expert-stack free dim {hidden}.*{stick}-element stick.*hidden_size"
+    match = rf"hidden size {hidden} must split into {_MOE_CHUNKS} chunks.*{stick}-element sticks"
     with pytest.raises(ValueError, match=match):
         _prepare_layer(layer)
 
@@ -1044,7 +1046,7 @@ def test_relayout_splits_and_transposes_the_generic_expert_stacks(inter):
     assert layer.spyre_moe_up.shape == (EXPERTS, HIDDEN, width)
     assert layer.spyre_moe_gate_alias.shape == (EXPERTS * chunks, HIDDEN // chunks, width)
     assert layer.spyre_moe_up_alias.shape == (EXPERTS * chunks, HIDDEN // chunks, width)
-    assert layer.spyre_moe_down_persistent.shape == (EXPERTS, width, HIDDEN)
+    assert layer.spyre_moe_down.shape == (EXPERTS, width, HIDDEN)
     assert layer.spyre_moe_route_identity.shape == (layer.spyre_moe_stick, layer.spyre_moe_stick)
     # Both follow the stacks' dtype, not a literal: a stick's element count changes with
     # it, and the identity multiplies routing weights that arrive in that same dtype.
@@ -1055,11 +1057,11 @@ def test_relayout_splits_and_transposes_the_generic_expert_stacks(inter):
     gather_layout = [EXPERTS, HIDDEN, width // stick, stick]
     for stack in (layer.spyre_moe_gate, layer.spyre_moe_up):
         assert get_spyre_tensor_layout(stack).device_size == gather_layout
-    down_persistent_layout = get_spyre_tensor_layout(layer.spyre_moe_down_persistent)
-    assert down_persistent_layout.device_size == [EXPERTS, HIDDEN // stick, width, stick]
-    assert down_persistent_layout.stride_map == [width * HIDDEN, stick, HIDDEN, 1]
-    down_decode_layout = get_spyre_tensor_layout(layer.spyre_moe_down)
-    assert layer.spyre_moe_down.shape == (EXPERTS * chunks, width, HIDDEN // chunks)
+    down_layout = get_spyre_tensor_layout(layer.spyre_moe_down)
+    assert down_layout.device_size == [EXPERTS, HIDDEN // stick, width, stick]
+    assert down_layout.stride_map == [width * HIDDEN, stick, HIDDEN, 1]
+    down_decode_layout = get_spyre_tensor_layout(layer.spyre_moe_down_alias)
+    assert layer.spyre_moe_down_alias.shape == (EXPERTS * chunks, width, HIDDEN // chunks)
     assert down_decode_layout.device_size == [
         EXPERTS * chunks,
         HIDDEN // chunks // stick,
@@ -1070,8 +1072,8 @@ def test_relayout_splits_and_transposes_the_generic_expert_stacks(inter):
 
     close = {"atol": 1e-4, "rtol": 1e-2}
     gate, up = (t.cpu() for t in (layer.spyre_moe_gate, layer.spyre_moe_up))
-    down = layer.spyre_moe_down.cpu()
-    down_persist = layer.spyre_moe_down_persistent.cpu()
+    down = layer.spyre_moe_down_alias.cpu()
+    down_persist = layer.spyre_moe_down.cpu()
     down_ref = F.pad(
         (w2 * scale.view(EXPERTS, 1, 1)).transpose(1, 2),
         (0, 0, 0, width - inter),
@@ -1094,9 +1096,27 @@ def test_relayout_splits_and_transposes_the_generic_expert_stacks(inter):
     control = dma_moe_expert_weight_to_spyre(down_ref)
     candidate = _to_spyre_expert_weight(down_ref, (), kernel_order=True)
     assert control is not None
-    assert get_spyre_tensor_layout(candidate).device_size == down_persistent_layout.device_size
+    assert get_spyre_tensor_layout(candidate).device_size == down_layout.device_size
     assert torch.equal(control.cpu(), candidate.cpu())
     assert torch.equal(candidate.cpu(), down_persist)
+
+
+def test_chunk_aliases_reject_a_pool_in_the_other_layout():
+    """Each alias reinterprets one assumed layout; the other would silently read wrong weights."""
+    from spyre_inference.moe import (
+        _MOE_CHUNKS,
+        _chunk_pool_alias,
+        _down_chunk_pool_alias,
+        _to_spyre_expert_weight,
+    )
+
+    stack = torch.zeros(EXPERTS, HIDDEN, HIDDEN, dtype=torch.float16)
+    gather = _to_spyre_expert_weight(stack, ())
+    kernel = _to_spyre_expert_weight(stack, (), kernel_order=True)
+    with pytest.raises(RuntimeError, match="its chunk alias reinterprets"):
+        _chunk_pool_alias(kernel, _MOE_CHUNKS)
+    with pytest.raises(RuntimeError, match="its chunk alias reinterprets"):
+        _down_chunk_pool_alias(gather, _MOE_CHUNKS)
 
 
 @pytest.mark.parametrize(("contract", "free"), [(6, 4), (7, 4), (6, 1), (1, 3)])

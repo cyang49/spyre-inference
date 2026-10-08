@@ -54,10 +54,10 @@ if TYPE_CHECKING:
         spyre_moe_route_dtype: torch.dtype
         spyre_moe_gate: torch.Tensor
         spyre_moe_up: torch.Tensor
+        spyre_moe_down: torch.Tensor
         spyre_moe_gate_alias: torch.Tensor
         spyre_moe_up_alias: torch.Tensor
-        spyre_moe_down: torch.Tensor
-        spyre_moe_down_persistent: torch.Tensor
+        spyre_moe_down_alias: torch.Tensor
         spyre_moe_route_identity: torch.Tensor
 
 
@@ -66,6 +66,10 @@ logger = init_logger(__name__)
 _MOE_COMPILER_CONFIG = {"frontend_pool_allocation": True}
 _PERSISTENT_COMPILER_CONFIG = {"allow_all_ops_in_lx_planning": True}
 
+# Decode splits each expert's hidden axis into this many slices. A gather divides work only
+# along its entries, so one token's ``top_k`` experts alone occupy ``top_k`` cores; Gemma 4's
+# 8 experts x 4 slices give 32 entries, one per core (``SENCORES // top_k``). The weight
+# aliases bake it in at load time, which is why it is a constant rather than per-step.
 _MOE_CHUNKS = 4
 
 
@@ -260,26 +264,21 @@ def _moe_gathered(
     # Finish each stack's projection before processing the next to limit live intermediates.
     gate_out = (
         torch.bmm(inputs, gate[slice_index].reshape(rows * chunks, slice_rows, inter))
-        .reshape(chunks, tokens, top_k, inter)
-        .permute(1, 2, 0, 3)
-        .sum(dim=2)
-        .reshape(rows, 1, inter)
+        .reshape(chunks, rows, 1, inter)
+        .sum(dim=0)
     )
     up_out = (
         torch.bmm(inputs, up[slice_index].reshape(rows * chunks, slice_rows, inter))
-        .reshape(chunks, tokens, top_k, inter)
-        .permute(1, 2, 0, 3)
-        .sum(dim=2)
-        .reshape(rows, 1, inter)
+        .reshape(chunks, rows, 1, inter)
+        .sum(dim=0)
     )
     # Reuse the activated rows across output chunks and select each down-weight slice by expert.
     activated = _activation(gate_out, up_out, activation)
-    act_rep = torch.cat([activated.reshape(rows, 1, inter) for _ in range(chunks)], dim=0)
+    act_rep = activated.expand(chunks, rows, 1, inter).reshape(rows * chunks, 1, inter)
     # ``slice_index`` encodes e*chunks+c in chunk,row order, matching the down alias.
-    slice_index_down = slice_index
-    parts = torch.bmm(
-        act_rep, down[slice_index_down].reshape(rows * chunks, inter, slice_rows)
-    ).reshape(chunks, tokens, top_k, slice_rows)
+    parts = torch.bmm(act_rep, down[slice_index].reshape(rows * chunks, inter, slice_rows)).reshape(
+        chunks, tokens, top_k, slice_rows
+    )
     expert_out = torch.cat([parts[c] for c in range(chunks)], dim=-1)
     return (expert_out * weights[..., None]).sum(dim=1)
 
@@ -413,7 +412,7 @@ def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
         router_logits,
         layer.spyre_moe_gate_alias,
         layer.spyre_moe_up_alias,
-        layer.spyre_moe_down,
+        layer.spyre_moe_down_alias,
         layer.top_k,
         layer.spyre_moe_stick,
         layer.spyre_moe_route_dtype,
@@ -471,7 +470,7 @@ def _experts(layer: RoutedExperts, x: torch.Tensor, route: torch.Tensor) -> torc
         route,
         layer.spyre_moe_gate,
         layer.spyre_moe_up,
-        layer.spyre_moe_down_persistent,
+        layer.spyre_moe_down,
         layer.spyre_moe_recipe.activation,
     )
 
@@ -522,6 +521,17 @@ def _to_spyre_expert_weight(
     return weight.to(device_layout=layout)  # ty: ignore[no-matching-overload]
 
 
+def _check_pool_layout(pool: torch.Tensor, expected: SpyreTensorLayout) -> None:
+    from torch_spyre._C import get_spyre_tensor_layout
+
+    actual = get_spyre_tensor_layout(pool)
+    if (actual.device_size, actual.stride_map) != (expected.device_size, expected.stride_map):
+        raise RuntimeError(
+            f"MoE pool device layout {actual.device_size} / {actual.stride_map} differs from "
+            f"the {expected.device_size} / {expected.stride_map} its chunk alias reinterprets."
+        )
+
+
 def _chunk_pool_alias(pool: torch.Tensor, chunks: int) -> torch.Tensor:
     """Expose a whole-expert [E, contract, free] pool as [E*chunks, contract/chunks, free].
 
@@ -531,12 +541,21 @@ def _chunk_pool_alias(pool: torch.Tensor, chunks: int) -> torch.Tensor:
     from torch_spyre._C import SpyreTensorLayout, get_device_dtype
 
     experts, contract, free = pool.shape
+    if contract % chunks:
+        raise ValueError(f"gate/up contract dim {contract} must divide into {chunks} chunks")
     eps = SpyreTensorLayout([experts, contract, free], pool.dtype).elems_per_stick()
+    device_dtype = get_device_dtype(pool.dtype)
+    _check_pool_layout(
+        pool,
+        SpyreTensorLayout(
+            [experts, contract, free // eps, eps], [contract * free, free, eps, 1], device_dtype
+        ),
+    )
     c4 = contract // chunks
     layout = SpyreTensorLayout(
         [experts * chunks, c4, free // eps, eps],
         [c4 * free, free, eps, 1],
-        get_device_dtype(pool.dtype),
+        device_dtype,
     )
     return _C.reinterpret_tensor_with_layout(
         pool,
@@ -562,6 +581,7 @@ def _down_chunk_pool_alias(pool: torch.Tensor, chunks: int) -> torch.Tensor:
         raise ValueError(
             f"down hidden size {hidden} must divide into {chunks} stick-aligned chunks"
         )
+    _check_pool_layout(pool, _expert_kernel_layout(pool))
     chunk_hidden = hidden // chunks
     size = [experts * chunks, inter, chunk_hidden]
     stride = [inter * chunk_hidden, chunk_hidden, 1]
@@ -590,14 +610,16 @@ def _prepare_layer(layer: RoutedExperts) -> None:
     # TP divides ``inter`` by the rank count, so it need not span whole sticks. Widening
     # is inert: the added lanes activate to zero, against zero rows of ``down``.
     stick = get_elem_in_stick(w13.dtype)
-    if hidden % stick:
+    chunks = _MOE_CHUNKS
+    # Rejected before any relayout: a failure past the first move would leave the layer
+    # half-converted, and a retry would then report the weights immutable.
+    if hidden % (chunks * stick):
         raise ValueError(
-            f"Spyre MoE down expert-stack free dim {hidden} is not a multiple of "
-            f"the {stick}-element stick; hidden_size must be stick-aligned."
+            f"Spyre MoE hidden size {hidden} must split into {chunks} chunks of whole "
+            f"{stick}-element sticks (a multiple of {chunks * stick})."
         )
     pad = -inter % stick
     # Share gate/up allocations between persistent and chunked-decode views.
-    chunks = _MOE_CHUNKS
     layer.spyre_moe_gate = _to_spyre_expert_weight(w13[:, :inter, :].transpose(1, 2), (0, pad))
     layer.spyre_moe_up = _to_spyre_expert_weight(w13[:, inter:, :].transpose(1, 2), (0, pad))
 
@@ -611,10 +633,10 @@ def _prepare_layer(layer: RoutedExperts) -> None:
     # Down's free dim (hidden) is too wide for one weight chunk; in the gather layout its rows
     # would stream in short transfers. Share the down-weight allocation between persistent and
     # chunked-decode views.
-    layer.spyre_moe_down_persistent = _to_spyre_expert_weight(
+    layer.spyre_moe_down = _to_spyre_expert_weight(
         w2.transpose(1, 2), (0, 0, 0, pad), kernel_order=True
     )
-    layer.spyre_moe_down = _down_chunk_pool_alias(layer.spyre_moe_down_persistent, chunks)
+    layer.spyre_moe_down_alias = _down_chunk_pool_alias(layer.spyre_moe_down, chunks)
     del layer.w2_weight, w2
 
     dtype = layer.spyre_moe_gate.dtype
@@ -728,9 +750,7 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             else:
                 topk_probs = _region(layer, "topk_probs", _topk_probs)(router_logits, layer.top_k)
                 route = _region(layer, "route_selected", _route_selected)(layer, topk_probs)
-            _name_persistent_dims(
-                x, layer.spyre_moe_gate, layer.spyre_moe_up, layer.spyre_moe_down_persistent
-            )
+            _name_persistent_dims(x, layer.spyre_moe_gate, layer.spyre_moe_up, layer.spyre_moe_down)
             try:
                 with persistent_scope:
                     return _region(layer, "experts", _experts)(layer, x, route)
