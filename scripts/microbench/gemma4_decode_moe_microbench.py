@@ -42,17 +42,29 @@ SPAN = "gemma4_decode_moe"
 
 def _device_layer(seed: int) -> tuple[SimpleNamespace, dict[str, torch.Tensor]]:
     from torch_spyre._C import get_elem_in_stick
+    from torch_spyre._inductor import config as spyre_config
 
-    from spyre_inference import moe
+    from spyre_inference import envs, moe
     from spyre_inference.moe import (
         SpyreMoERecipe,
+        _derive_moe_chunks,
         _down_chunk_pool_alias,
         _route_reduce_dtype,
         _to_spyre_expert_weight,
     )
 
-    chunks = moe._MOE_CHUNKS
-
+    stick = get_elem_in_stick(DTYPE)
+    chunks = _derive_moe_chunks(
+        HIDDEN,
+        INTER,
+        TOP_K,
+        stick,
+        torch.empty((), dtype=DTYPE).element_size(),
+        spyre_config.sencores,
+        envs.SPYRE_MOE_CHUNKS,
+    )
+    if chunks is None:
+        raise RuntimeError("the selected Gemma 4 MoE shape has no safe gathered chunk layout")
     generator = torch.Generator().manual_seed(seed)
     gate = torch.randn(EXPERTS, HIDDEN, INTER, dtype=DTYPE, generator=generator).mul_(0.01)
     up = torch.randn(EXPERTS, HIDDEN, INTER, dtype=DTYPE, generator=generator).mul_(0.01)
@@ -67,7 +79,6 @@ def _device_layer(seed: int) -> tuple[SimpleNamespace, dict[str, torch.Tensor]]:
     up_alias = moe._chunk_pool_alias(up_device, chunks)
     down_alias = _down_chunk_pool_alias(down_device, chunks)
 
-    stick = get_elem_in_stick(DTYPE)
     layer = SimpleNamespace(
         spyre_moe_recipe=SpyreMoERecipe("gelu_tanh", "full_softmax"),
         spyre_moe_gate=gate_device,
@@ -80,6 +91,7 @@ def _device_layer(seed: int) -> tuple[SimpleNamespace, dict[str, torch.Tensor]]:
         spyre_moe_route_dtype=_route_reduce_dtype(EXPERTS, DTYPE),
         spyre_moe_regions={},
         top_k=TOP_K,
+        spyre_moe_chunks=chunks,
     )
     return layer, {"gate": gate, "up": up, "down": down}
 

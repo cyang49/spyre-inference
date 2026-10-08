@@ -51,13 +51,14 @@ if TYPE_CHECKING:
         spyre_moe_recipe: SpyreMoERecipe
         spyre_moe_regions: dict[str, Any]
         spyre_moe_stick: int
+        spyre_moe_chunks: int | None
         spyre_moe_route_dtype: torch.dtype
         spyre_moe_gate: torch.Tensor
         spyre_moe_up: torch.Tensor
         spyre_moe_down: torch.Tensor
-        spyre_moe_gate_alias: torch.Tensor
-        spyre_moe_up_alias: torch.Tensor
-        spyre_moe_down_alias: torch.Tensor
+        spyre_moe_gate_alias: torch.Tensor | None
+        spyre_moe_up_alias: torch.Tensor | None
+        spyre_moe_down_alias: torch.Tensor | None
         spyre_moe_route_identity: torch.Tensor
 
 
@@ -66,11 +67,61 @@ logger = init_logger(__name__)
 _MOE_COMPILER_CONFIG = {"frontend_pool_allocation": True}
 _PERSISTENT_COMPILER_CONFIG = {"allow_all_ops_in_lx_planning": True}
 
-# Decode splits each expert's hidden axis into this many slices. A gather divides work only
-# along its entries, so one token's ``top_k`` experts alone occupy ``top_k`` cores; Gemma 4's
-# 8 experts x 4 slices give 32 entries, one per core (``SENCORES // top_k``). The weight
-# aliases bake it in at load time, which is why it is a constant rather than per-step.
-_MOE_CHUNKS = 4
+# Budget for one gathered gate/up/down weight operand per core, not the device's total LX.
+_MOE_GATHER_WEIGHT_BUDGET_PER_CORE_BYTES = 1_500_000
+
+
+def _derive_moe_chunks(
+    hidden: int,
+    inter: int,
+    top_k: int,
+    stick: int,
+    element_size: int,
+    max_cores: int,
+    override: int | None = None,
+) -> int | None:
+    """Choose a core-filling, stick-legal chunk count within the gathered-weight budget.
+
+    The gathered kernel splits work only across its ``top_k * chunks`` entries. The per-core
+    footprint includes every selected weight entry assigned to that core; down has the same
+    footprint. ``None`` means no automatic gathered layout fits, so dispatch uses persistent.
+    """
+    if hidden <= 0 or inter <= 0 or top_k <= 0 or stick <= 0 or element_size <= 0:
+        raise ValueError("MoE chunk selection requires positive dimensions, top_k, and stick size")
+    if max_cores <= 0:
+        raise ValueError(f"MoE chunk selection requires at least one core, got {max_cores}")
+    if hidden % stick:
+        raise ValueError(
+            f"Spyre MoE hidden size {hidden} must be a multiple of {stick}-element sticks."
+        )
+    if override is not None:
+        if override <= 0:
+            raise ValueError(f"SPYRE_MOE_CHUNKS must be positive, got {override}")
+        if hidden % (override * stick):
+            raise ValueError(
+                f"SPYRE_MOE_CHUNKS={override} requires hidden size {hidden} to split into "
+                f"{override} whole {stick}-element-stick chunks."
+            )
+        return override
+
+    padded_inter = inter + (-inter % stick)
+    hidden_sticks = hidden // stick
+    best: tuple[int, int, int] | None = None
+    for chunks in range(1, hidden_sticks + 1):
+        if hidden_sticks % chunks:
+            continue
+        entries = top_k * chunks
+        cores_used = max(
+            split for split in range(1, min(entries, max_cores) + 1) if entries % split == 0
+        )
+        entries_per_core = entries // cores_used
+        bytes_per_core = entries_per_core * (hidden // chunks) * padded_inter * element_size
+        if bytes_per_core > _MOE_GATHER_WEIGHT_BUDGET_PER_CORE_BYTES:
+            continue
+        candidate = (cores_used, -chunks, chunks)
+        if best is None or candidate > best:
+            best = candidate
+    return best[2] if best is not None else None
 
 
 @dataclass(frozen=True)
@@ -211,13 +262,13 @@ def _moe_gathered(
     up: torch.Tensor,
     down: torch.Tensor,
     top_k: int,
+    chunks: int,
     stick: int,
     reduce_dtype: torch.dtype,
     routing: str,
     activation: str,
 ) -> torch.Tensor:
     tokens, hidden = x.shape
-    chunks = _MOE_CHUNKS
     if hidden % chunks:
         raise ValueError(
             f"gathered MoE hidden size {hidden} must divide evenly into {chunks} chunks"
@@ -407,13 +458,22 @@ def _moe_persistent_in_graph(
 
 def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
     recipe = layer.spyre_moe_recipe
-    return _moe_gathered(
-        x,
-        router_logits,
+    chunks = layer.spyre_moe_chunks
+    gate, up, down = (
         layer.spyre_moe_gate_alias,
         layer.spyre_moe_up_alias,
         layer.spyre_moe_down_alias,
+    )
+    if chunks is None or gate is None or up is None or down is None:
+        raise RuntimeError("the gathered MoE path has no scratchpad-safe chunk layout")
+    return _moe_gathered(
+        x,
+        router_logits,
+        gate,
+        up,
+        down,
         layer.top_k,
+        chunks,
         layer.spyre_moe_stick,
         layer.spyre_moe_route_dtype,
         recipe.routing,
@@ -608,36 +668,58 @@ def _prepare_layer(layer: RoutedExperts) -> None:
             f"unexpected MoE expert weight shapes: w13={tuple(w13.shape)} w2={w2_shape}"
         )
 
-    # TP divides ``inter`` by the rank count, so it need not span whole sticks. Widening
-    # is inert: the added lanes activate to zero, against zero rows of ``down``.
+    from torch_spyre._inductor import config as spyre_config
+
+    # All shape, alignment, and scratch-budget checks run before the first device relayout.
     stick = get_elem_in_stick(w13.dtype)
-    chunks = _MOE_CHUNKS
-    # Rejected before any relayout: a failure past the first move would leave the layer
-    # half-converted, and a retry would then report the weights immutable.
-    if hidden % (chunks * stick):
-        raise ValueError(
-            f"Spyre MoE hidden size {hidden} must split into {chunks} chunks of whole "
-            f"{stick}-element sticks (a multiple of {chunks * stick})."
-        )
+    chunks = _derive_moe_chunks(
+        hidden,
+        inter,
+        layer.top_k,
+        stick,
+        w13.element_size(),
+        spyre_config.sencores,
+        envs.SPYRE_MOE_CHUNKS,
+    )
     pad = -inter % stick
-    # Share gate/up allocations between persistent and chunked-decode views.
+    # Share gate/up allocations between persistent and gathered chunk views.
     layer.spyre_moe_gate = _to_spyre_expert_weight(w13[:, :inter, :].transpose(1, 2), (0, pad))
     layer.spyre_moe_up = _to_spyre_expert_weight(w13[:, inter:, :].transpose(1, 2), (0, pad))
-
-    layer.spyre_moe_gate_alias = _chunk_pool_alias(layer.spyre_moe_gate, chunks)
-    layer.spyre_moe_up_alias = _chunk_pool_alias(layer.spyre_moe_up, chunks)
+    layer.spyre_moe_chunks = chunks
+    layer.spyre_moe_gate_alias = (
+        _chunk_pool_alias(layer.spyre_moe_gate, chunks) if chunks is not None else None
+    )
+    layer.spyre_moe_up_alias = (
+        _chunk_pool_alias(layer.spyre_moe_up, chunks) if chunks is not None else None
+    )
     del layer.w13_weight, w13
     w2 = layer.get_parameter("w2_weight").data
     transform_down = layer.spyre_moe_recipe.prepare_down_weight
     if transform_down is not None:
         w2 = transform_down(w2)
-    # Down's free dim (hidden) is too wide for one weight chunk; in the gather layout its rows
-    # would stream in short transfers. Share the down-weight allocation between persistent and
-    # chunked-decode views.
+    # The persistent form remains available if no safe gathered chunk layout exists.
     layer.spyre_moe_down = _to_spyre_expert_weight(
         w2.transpose(1, 2), (0, 0, 0, pad), kernel_order=True
     )
-    layer.spyre_moe_down_alias = _down_chunk_pool_alias(layer.spyre_moe_down, chunks)
+    layer.spyre_moe_down_alias = (
+        _down_chunk_pool_alias(layer.spyre_moe_down, chunks) if chunks is not None else None
+    )
+    if chunks is None:
+        logger.info_once(
+            "Spyre MoE: no gathered chunk layout fits top_k=%d, hidden=%d, intermediate=%d "
+            "and %d cores; using the persistent path.",
+            layer.top_k,
+            hidden,
+            inter + pad,
+            spyre_config.sencores,
+        )
+    else:
+        logger.info_once(
+            "Spyre MoE: selected %d gathered weight chunks (top_k=%d, cores=%d).",
+            chunks,
+            layer.top_k,
+            spyre_config.sencores,
+        )
     del layer.w2_weight, w2
 
     dtype = layer.spyre_moe_gate.dtype
@@ -735,9 +817,12 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             )
         moe_scope, persistent_scope = _compiler_scopes()
         # A single row is handed to the region whole, so no row slice needs an addressable offset.
-        if tokens == 1 or (
-            tokens <= envs.SPYRE_MOE_GATHERED_MAX_TOKENS
-            and _rows_are_stick_addressable(x, router_logits, layer.spyre_moe_stick)
+        if layer.spyre_moe_chunks is not None and (
+            tokens == 1
+            or (
+                tokens <= envs.SPYRE_MOE_GATHERED_MAX_TOKENS
+                and _rows_are_stick_addressable(x, router_logits, layer.spyre_moe_stick)
+            )
         ):
             with moe_scope:
                 if tokens == 1:

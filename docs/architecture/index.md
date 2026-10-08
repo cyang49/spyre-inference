@@ -168,21 +168,25 @@ second weight pool.
 | `spyre_moe_down_alias` | `[E·C, M, H/C]` | `[E·C, H/(C·s), M, s]` | gathered |
 
 `s` is the stick (64 fp16 elements), `M` the intermediate dim zero-widened to whole sticks,
-and `C` is `_MOE_CHUNKS` (4). Alias entry `e·C + c` is slice `c` of expert `e`. TP narrows
-only `M`, so the slicing is the same at every TP degree.
+and `C` is selected once during load by `_derive_moe_chunks`, using `top_k`, the configured
+core count, legal divisors of `H/s`, and a 1.5 MB per-core gathered-weight budget. For Gemma 4
+with `top_k=8` and 32 cores this selects `C=4`. `SPYRE_MOE_CHUNKS` overrides the derived
+value; the override must still split `H` into whole-stick chunks and bypasses the budget check,
+so it can cause extra spills or make compilation fail. Alias entry `e·C + c` is chunk `c` of
+expert `e`. TP narrows only `M`, so the slicing is unchanged at every TP degree.
 
-The gathered form slices the hidden dim because a gather divides work only along its entries:
-one token's `top_k` experts alone would occupy `top_k` cores, while Gemma 4's 8 experts × 4
-slices fill all 32. Gate/up slice their contraction dim (rows of `H`); down slices its output
-dim (columns of `H`).
+The gathered form slices the hidden dim because a gather divides work only along its entries.
+Gate/up slice their contraction dim (rows of `H`); down slices its output dim (columns of `H`).
+If no automatic chunk count fits the weight budget, the aliases are omitted and dispatch uses
+the persistent form.
 
 An alias is only valid when the sliced axis sits directly inside the expert axis in device
 order, so that each slice is one contiguous block and slicing merely relabels the flat order.
 That is what fixes each stack's layout. Gate/up keep `H` outer to the `M` sticks (the gather
 layout); down keeps the `H` sticks outer to `M` (the `nn.Linear` order its persistent matmul
 wants anyway — in the gather layout its long `H` rows would stream in short transfers). The
-other layout would not alias for either stack. `_prepare_layer` rejects `H % (C·s) != 0`
-before moving anything, and each alias checks the pool's actual device layout before
+other layout would not alias for either stack. The selected `C` guarantees `H % (C·s) == 0`
+before any weights move, and each alias checks the pool's actual device layout before
 reinterpreting it.
 
 The two forms differ numerically in one place: the gathered form sums gate/up over `C` fp16
