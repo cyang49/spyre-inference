@@ -579,15 +579,15 @@ def test_above_the_gathered_bound_the_all_expert_form_takes_the_batch(monkeypatc
     assert resets == [1]
 
 
-def test_missing_safe_chunk_layout_uses_persistent_dispatch(monkeypatch):
+def test_single_chunk_fallback_uses_gathered_dispatch(monkeypatch):
     calls, resets = _dispatch_recorder(monkeypatch)
     layer = _dispatch_layer("full_softmax")
-    layer.spyre_moe_chunks = None
+    layer.spyre_moe_chunks = 1
 
     _apply(layer, tokens=1)
 
-    assert calls == [("probs", "_probs"), ("route", "_route"), ("experts", "_experts")]
-    assert resets == [1]
+    assert calls == [("gathered", "_gathered")]
+    assert resets == []
 
 
 @pytest.mark.parametrize(
@@ -684,7 +684,9 @@ def test_post_load_builds_the_quant_config_before_the_first_traced_call(monkeypa
     assert method.moe_quant_config is not None
 
 
-@pytest.mark.parametrize("chunks_override", [None, 2], ids=["derived", "override"])
+@pytest.mark.parametrize(
+    "chunks_override", [None, 1, 2], ids=["derived", "single_chunk", "override"]
+)
 def test_gathered_matches_dense_reference(moe_weights, chunks_override):
     """The gathered form matches the dense reference at its derived and override layouts.
 
@@ -860,7 +862,7 @@ def test_gathered_loop_matches_dense_reference(stick_aligned_moe_weights, num_to
     torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-2)
 
 
-# 8 and 16: decode batches above SPYRE_MOE_GATHERED_MAX_TOKENS; 512: one prefill chunk.
+# 8 and 16: decode beyond the gathered bound; 512: prefill.
 @pytest.mark.parametrize(
     ("num_tokens", "routing_margin"),
     [(8, True), (16, True), (24, True), (32, True), (512, True), (512, False)],
@@ -1100,6 +1102,25 @@ def test_prepare_layer_honors_chunk_override(monkeypatch):
     assert layer.spyre_moe_down_alias is not None
     assert layer.spyre_moe_gate_alias.shape == (EXPERTS * 2, HIDDEN // 2, INTER)
     assert layer.spyre_moe_down_alias.shape == (EXPERTS * 2, INTER, HIDDEN // 2)
+
+
+def test_prepare_layer_uses_c1_when_selector_returns_none(monkeypatch):
+    from spyre_inference import moe as moe_module
+    from spyre_inference.moe import SpyreMoERecipe, _prepare_layer
+
+    monkeypatch.setattr(moe_module, "_derive_moe_chunks", lambda *args, **kwargs: None)
+    layer = _RoutedExperts(
+        torch.randn(EXPERTS, 2 * INTER, HIDDEN, dtype=torch.float16),
+        torch.randn(EXPERTS, HIDDEN, INTER, dtype=torch.float16),
+    )
+    layer.spyre_moe_recipe = SpyreMoERecipe("gelu_tanh", "full_softmax")
+
+    _prepare_layer(layer)
+
+    assert layer.spyre_moe_chunks == 1
+    assert layer.spyre_moe_gate_alias.shape == (EXPERTS, HIDDEN, INTER)
+    assert layer.spyre_moe_up_alias.shape == (EXPERTS, HIDDEN, INTER)
+    assert layer.spyre_moe_down_alias.shape == (EXPERTS, INTER, HIDDEN)
 
 
 # Exercise the actual Gemma 4 TP=2 and TP=4 expert widths with the reduced test hidden size.

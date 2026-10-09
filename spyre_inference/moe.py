@@ -51,14 +51,14 @@ if TYPE_CHECKING:
         spyre_moe_recipe: SpyreMoERecipe
         spyre_moe_regions: dict[str, Any]
         spyre_moe_stick: int
-        spyre_moe_chunks: int | None
+        spyre_moe_chunks: int
         spyre_moe_route_dtype: torch.dtype
         spyre_moe_gate: torch.Tensor
         spyre_moe_up: torch.Tensor
         spyre_moe_down: torch.Tensor
-        spyre_moe_gate_alias: torch.Tensor | None
-        spyre_moe_up_alias: torch.Tensor | None
-        spyre_moe_down_alias: torch.Tensor | None
+        spyre_moe_gate_alias: torch.Tensor
+        spyre_moe_up_alias: torch.Tensor
+        spyre_moe_down_alias: torch.Tensor
         spyre_moe_route_identity: torch.Tensor
 
 
@@ -84,7 +84,8 @@ def _derive_moe_chunks(
 
     The gathered kernel splits work only across its ``top_k * chunks`` entries. The per-core
     footprint includes every selected weight entry assigned to that core; down has the same
-    footprint. ``None`` means no automatic gathered layout fits, so dispatch uses persistent.
+    footprint. ``None`` means no automatic split fits the residency estimate; layer preparation
+    falls back to a C=1 gathered layout.
     """
     if hidden <= 0 or inter <= 0 or top_k <= 0 or stick <= 0 or element_size <= 0:
         raise ValueError("MoE chunk selection requires positive dimensions, top_k, and stick size")
@@ -464,8 +465,6 @@ def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
         layer.spyre_moe_up_alias,
         layer.spyre_moe_down_alias,
     )
-    if chunks is None or gate is None or up is None or down is None:
-        raise RuntimeError("the gathered MoE path has no scratchpad-safe chunk layout")
     return _moe_gathered(
         x,
         router_logits,
@@ -681,39 +680,38 @@ def _prepare_layer(layer: RoutedExperts) -> None:
         spyre_config.sencores,
         envs.SPYRE_MOE_CHUNKS,
     )
+    fallback_to_c1 = chunks is None
+    if chunks is None:
+        # The budget estimates residency, not correctness. C=1 still gathers selected
+        # experts, while persistent execution visits every expert.
+        logger.info_once(
+            "Spyre MoE: no gathered split fits the residency estimate for top_k=%d, "
+            "hidden=%d, intermediate=%d; using C=1 gathered fallback.",
+            layer.top_k,
+            hidden,
+            inter,
+        )
+        chunks = 1
+    # TP can leave intermediate shards mid-stick; zero-padding is inert because those
+    # activation lanes multiply zero rows in the down stack.
     pad = -inter % stick
     # Share gate/up allocations between persistent and gathered chunk views.
     layer.spyre_moe_gate = _to_spyre_expert_weight(w13[:, :inter, :].transpose(1, 2), (0, pad))
     layer.spyre_moe_up = _to_spyre_expert_weight(w13[:, inter:, :].transpose(1, 2), (0, pad))
     layer.spyre_moe_chunks = chunks
-    layer.spyre_moe_gate_alias = (
-        _chunk_pool_alias(layer.spyre_moe_gate, chunks) if chunks is not None else None
-    )
-    layer.spyre_moe_up_alias = (
-        _chunk_pool_alias(layer.spyre_moe_up, chunks) if chunks is not None else None
-    )
+    layer.spyre_moe_gate_alias = _chunk_pool_alias(layer.spyre_moe_gate, chunks)
+    layer.spyre_moe_up_alias = _chunk_pool_alias(layer.spyre_moe_up, chunks)
     del layer.w13_weight, w13
     w2 = layer.get_parameter("w2_weight").data
     transform_down = layer.spyre_moe_recipe.prepare_down_weight
     if transform_down is not None:
         w2 = transform_down(w2)
-    # The persistent form remains available if no safe gathered chunk layout exists.
+    # Keep the complete stack for persistent compute and expose a view for gathered decode.
     layer.spyre_moe_down = _to_spyre_expert_weight(
         w2.transpose(1, 2), (0, 0, 0, pad), kernel_order=True
     )
-    layer.spyre_moe_down_alias = (
-        _down_chunk_pool_alias(layer.spyre_moe_down, chunks) if chunks is not None else None
-    )
-    if chunks is None:
-        logger.info_once(
-            "Spyre MoE: no gathered chunk layout fits top_k=%d, hidden=%d, intermediate=%d "
-            "and %d cores; using the persistent path.",
-            layer.top_k,
-            hidden,
-            inter + pad,
-            spyre_config.sencores,
-        )
-    else:
+    layer.spyre_moe_down_alias = _down_chunk_pool_alias(layer.spyre_moe_down, chunks)
+    if not fallback_to_c1:
         logger.info_once(
             "Spyre MoE: selected %d gathered weight chunks (top_k=%d, cores=%d).",
             chunks,
@@ -817,12 +815,9 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             )
         moe_scope, persistent_scope = _compiler_scopes()
         # A single row is handed to the region whole, so no row slice needs an addressable offset.
-        if layer.spyre_moe_chunks is not None and (
-            tokens == 1
-            or (
-                tokens <= envs.SPYRE_MOE_GATHERED_MAX_TOKENS
-                and _rows_are_stick_addressable(x, router_logits, layer.spyre_moe_stick)
-            )
+        if tokens == 1 or (
+            tokens <= envs.SPYRE_MOE_GATHERED_MAX_TOKENS
+            and _rows_are_stick_addressable(x, router_logits, layer.spyre_moe_stick)
         ):
             with moe_scope:
                 if tokens == 1:

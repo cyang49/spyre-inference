@@ -177,8 +177,9 @@ expert `e`. TP narrows only `M`, so the slicing is unchanged at every TP degree.
 
 The gathered form slices the hidden dim because a gather divides work only along its entries.
 Gate/up slice their contraction dim (rows of `H`); down slices its output dim (columns of `H`).
-If no automatic chunk count fits the weight budget, the aliases are omitted and dispatch uses
-the persistent form.
+If no automatic chunk count fits the weight budget, preparation uses C=1: the gather still
+selects only routed experts, though its working set may exceed the estimate. Persistent
+dispatch remains available for token batches above the gathered bound.
 
 An alias is only valid when the sliced axis sits directly inside the expert axis in device
 order, so that each slice is one contiguous block and slicing merely relabels the flat order.
