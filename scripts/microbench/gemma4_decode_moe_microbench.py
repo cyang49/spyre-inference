@@ -47,6 +47,7 @@ def _device_layer(seed: int) -> tuple[SimpleNamespace, dict[str, torch.Tensor]]:
     from spyre_inference import envs, moe
     from spyre_inference.moe import (
         SpyreMoERecipe,
+        _chunk_entry_constants,
         _derive_moe_chunks,
         _down_chunk_pool_alias,
         _route_reduce_dtype,
@@ -54,17 +55,7 @@ def _device_layer(seed: int) -> tuple[SimpleNamespace, dict[str, torch.Tensor]]:
     )
 
     stick = get_elem_in_stick(DTYPE)
-    chunks = _derive_moe_chunks(
-        HIDDEN,
-        INTER,
-        TOP_K,
-        stick,
-        torch.empty((), dtype=DTYPE).element_size(),
-        spyre_config.sencores,
-        envs.SPYRE_MOE_CHUNKS,
-    )
-    if chunks is None:
-        raise RuntimeError("the selected Gemma 4 MoE shape has no safe gathered chunk layout")
+    chunks = _derive_moe_chunks(HIDDEN, TOP_K, stick, spyre_config.sencores, envs.SPYRE_MOE_CHUNKS)
     generator = torch.Generator().manual_seed(seed)
     gate = torch.randn(EXPERTS, HIDDEN, INTER, dtype=DTYPE, generator=generator).mul_(0.01)
     up = torch.randn(EXPERTS, HIDDEN, INTER, dtype=DTYPE, generator=generator).mul_(0.01)
@@ -93,6 +84,7 @@ def _device_layer(seed: int) -> tuple[SimpleNamespace, dict[str, torch.Tensor]]:
         top_k=TOP_K,
         spyre_moe_chunks=chunks,
     )
+    layer.spyre_moe_chunk_scale, layer.spyre_moe_chunk_offsets = _chunk_entry_constants(chunks)
     return layer, {"gate": gate, "up": up, "down": down}
 
 

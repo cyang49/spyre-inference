@@ -59,6 +59,8 @@ if TYPE_CHECKING:
         spyre_moe_gate_alias: torch.Tensor
         spyre_moe_up_alias: torch.Tensor
         spyre_moe_down_alias: torch.Tensor
+        spyre_moe_chunk_scale: torch.Tensor
+        spyre_moe_chunk_offsets: torch.Tensor
         spyre_moe_route_identity: torch.Tensor
 
 
@@ -67,27 +69,21 @@ logger = init_logger(__name__)
 _MOE_COMPILER_CONFIG = {"frontend_pool_allocation": True}
 _PERSISTENT_COMPILER_CONFIG = {"allow_all_ops_in_lx_planning": True}
 
-# Budget for one gathered gate/up/down weight operand per core, not the device's total LX.
-_MOE_GATHER_WEIGHT_BUDGET_PER_CORE_BYTES = 1_500_000
-
 
 def _derive_moe_chunks(
     hidden: int,
-    inter: int,
     top_k: int,
     stick: int,
-    element_size: int,
     max_cores: int,
     override: int | None = None,
-) -> int | None:
-    """Choose a core-filling, stick-legal chunk count within the gathered-weight budget.
+) -> int:
+    """Choose the fewest stick-legal chunks that spread the gathered entries over the most cores.
 
-    The gathered kernel splits work only across its ``top_k * chunks`` entries. The per-core
-    footprint includes every selected weight entry assigned to that core; down has the same
-    footprint. ``None`` means no automatic split fits the residency estimate; layer preparation
-    falls back to a C=1 gathered layout.
+    The gathered kernel splits work only across its ``top_k * chunks`` entries. A core holds
+    ``top_k * hidden * inter / cores_used`` weight elements whatever the chunk count, so the
+    split that fills the most cores also has the smallest per-core working set.
     """
-    if hidden <= 0 or inter <= 0 or top_k <= 0 or stick <= 0 or element_size <= 0:
+    if hidden <= 0 or top_k <= 0 or stick <= 0:
         raise ValueError("MoE chunk selection requires positive dimensions, top_k, and stick size")
     if max_cores <= 0:
         raise ValueError(f"MoE chunk selection requires at least one core, got {max_cores}")
@@ -105,9 +101,8 @@ def _derive_moe_chunks(
             )
         return override
 
-    padded_inter = inter + (-inter % stick)
     hidden_sticks = hidden // stick
-    best: tuple[int, int, int] | None = None
+    best_cores, best_chunks = 0, 1
     for chunks in range(1, hidden_sticks + 1):
         if hidden_sticks % chunks:
             continue
@@ -115,14 +110,9 @@ def _derive_moe_chunks(
         cores_used = max(
             split for split in range(1, min(entries, max_cores) + 1) if entries % split == 0
         )
-        entries_per_core = entries // cores_used
-        bytes_per_core = entries_per_core * (hidden // chunks) * padded_inter * element_size
-        if bytes_per_core > _MOE_GATHER_WEIGHT_BUDGET_PER_CORE_BYTES:
-            continue
-        candidate = (cores_used, -chunks, chunks)
-        if best is None or candidate > best:
-            best = candidate
-    return best[2] if best is not None else None
+        if cores_used > best_cores:
+            best_cores, best_chunks = cores_used, chunks
+    return best_chunks
 
 
 @dataclass(frozen=True)
@@ -268,6 +258,9 @@ def _moe_gathered(
     reduce_dtype: torch.dtype,
     routing: str,
     activation: str,
+    *,
+    chunk_scale: torch.Tensor,
+    chunk_offsets: torch.Tensor,
 ) -> torch.Tensor:
     tokens, hidden = x.shape
     if hidden % chunks:
@@ -295,43 +288,30 @@ def _moe_gathered(
         )
     weights, raw_indices = _routing_weights(router_logits, top_k, routing, reduce_dtype)
     rows = tokens * top_k
-    # Entry e*chunks+c selects chunk c of expert e; entries are stored chunk-major.
+    # Entry e*chunks+c selects chunk c of expert e, in (row, chunk) order. Broadcasting against
+    # the [1, chunks, 1] device offsets, not a cat of per-chunk index tensors, keeps the region
+    # one kernel without per-call constants.
     expert_fp32 = (
         raw_indices.reshape(-1)[:, None].expand(rows, stick).contiguous().to(torch.float32)
     )
-    entries = torch.cat([expert_fp32 * float(chunks) + float(c) for c in range(chunks)], dim=0)
+    entries = (expert_fp32[:, None, :] * chunk_scale + chunk_offsets).reshape(rows * chunks, stick)
     slice_index = entries[..., : stick // 2].to(torch.int32)[:, 0]
-    # (chunk, row) batch order: chunk c's rows cover every expert of the step,
-    # so each chunk block of the x-operand repeats the token's chunk slice.
-    inputs = torch.cat(
-        [
-            x.reshape(tokens, 1, chunks, slice_rows)[:, :, c]
-            .reshape(tokens, 1, slice_rows)
-            .expand(tokens, top_k, slice_rows)
-            .reshape(rows, 1, slice_rows)
-            for c in range(chunks)
-        ],
-        dim=0,
+    inputs = (
+        x.reshape(tokens, 1, chunks, slice_rows)
+        .expand(tokens, top_k, chunks, slice_rows)
+        .contiguous()
+        .reshape(rows * chunks, 1, slice_rows)
     )
-    # Finish each stack's projection before processing the next to limit live intermediates.
-    gate_out = (
-        torch.bmm(inputs, gate[slice_index].reshape(rows * chunks, slice_rows, inter))
-        .reshape(chunks, rows, 1, inter)
-        .sum(dim=0)
-    )
-    up_out = (
-        torch.bmm(inputs, up[slice_index].reshape(rows * chunks, slice_rows, inter))
-        .reshape(chunks, rows, 1, inter)
-        .sum(dim=0)
-    )
-    # Reuse the activated rows across output chunks and select each down-weight slice by expert.
+    gate_out = torch.bmm(inputs, gate[slice_index].reshape(rows * chunks, slice_rows, inter))
+    up_out = torch.bmm(inputs, up[slice_index].reshape(rows * chunks, slice_rows, inter))
+    if chunks > 1:
+        gate_out = gate_out.reshape(rows, chunks, 1, inter).sum(dim=1)
+        up_out = up_out.reshape(rows, chunks, 1, inter).sum(dim=1)
     activated = _activation(gate_out, up_out, activation)
-    act_rep = activated.expand(chunks, rows, 1, inter).reshape(rows * chunks, 1, inter)
-    # ``slice_index`` encodes e*chunks+c in chunk,row order, matching the down alias.
-    parts = torch.bmm(act_rep, down[slice_index].reshape(rows * chunks, inter, slice_rows)).reshape(
-        chunks, tokens, top_k, slice_rows
-    )
-    expert_out = torch.cat([parts[c] for c in range(chunks)], dim=-1)
+    act_rep = activated[:, None].expand(rows, chunks, 1, inter).reshape(rows * chunks, 1, inter)
+    # Output chunk c of every row is the c-th hidden slice, so the parts reshape in place.
+    parts = torch.bmm(act_rep, down[slice_index].reshape(rows * chunks, inter, slice_rows))
+    expert_out = parts.reshape(tokens, top_k, hidden)
     return (expert_out * weights[..., None]).sum(dim=1)
 
 
@@ -477,6 +457,8 @@ def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
         layer.spyre_moe_route_dtype,
         recipe.routing,
         recipe.activation,
+        chunk_scale=layer.spyre_moe_chunk_scale,
+        chunk_offsets=layer.spyre_moe_chunk_offsets,
     )
 
 
@@ -580,6 +562,17 @@ def _to_spyre_expert_weight(
     return weight.to(device_layout=layout)  # ty: ignore[no-matching-overload]
 
 
+def _chunk_entry_constants(chunks: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Device scale and offsets of the gathered entry index ``e*chunks + c``.
+
+    Inputs rather than in-graph scalars, so the region needs no per-call constants; the
+    size-1 stick dim lets them broadcast against the widened fp32 expert index.
+    """
+    scale = torch.full((1, 1, 1), float(chunks), dtype=torch.float32).to("spyre")
+    offsets = torch.arange(chunks, dtype=torch.float32).reshape(1, chunks, 1).to("spyre")
+    return scale, offsets
+
+
 def _check_pool_layout(pool: torch.Tensor, expected: SpyreTensorLayout) -> None:
     from torch_spyre._C import get_spyre_tensor_layout
 
@@ -669,29 +662,11 @@ def _prepare_layer(layer: RoutedExperts) -> None:
 
     from torch_spyre._inductor import config as spyre_config
 
-    # All shape, alignment, and scratch-budget checks run before the first device relayout.
+    # All shape and alignment checks run before the first device relayout.
     stick = get_elem_in_stick(w13.dtype)
     chunks = _derive_moe_chunks(
-        hidden,
-        inter,
-        layer.top_k,
-        stick,
-        w13.element_size(),
-        spyre_config.sencores,
-        envs.SPYRE_MOE_CHUNKS,
+        hidden, layer.top_k, stick, spyre_config.sencores, envs.SPYRE_MOE_CHUNKS
     )
-    fallback_to_c1 = chunks is None
-    if chunks is None:
-        # The budget estimates residency, not correctness. C=1 still gathers selected
-        # experts, while persistent execution visits every expert.
-        logger.info_once(
-            "Spyre MoE: no gathered split fits the residency estimate for top_k=%d, "
-            "hidden=%d, intermediate=%d; using C=1 gathered fallback.",
-            layer.top_k,
-            hidden,
-            inter,
-        )
-        chunks = 1
     # TP can leave intermediate shards mid-stick; zero-padding is inert because those
     # activation lanes multiply zero rows in the down stack.
     pad = -inter % stick
@@ -711,13 +686,13 @@ def _prepare_layer(layer: RoutedExperts) -> None:
         w2.transpose(1, 2), (0, 0, 0, pad), kernel_order=True
     )
     layer.spyre_moe_down_alias = _down_chunk_pool_alias(layer.spyre_moe_down, chunks)
-    if not fallback_to_c1:
-        logger.info_once(
-            "Spyre MoE: selected %d gathered weight chunks (top_k=%d, cores=%d).",
-            chunks,
-            layer.top_k,
-            spyre_config.sencores,
-        )
+    layer.spyre_moe_chunk_scale, layer.spyre_moe_chunk_offsets = _chunk_entry_constants(chunks)
+    logger.info_once(
+        "Spyre MoE: selected %d gathered weight chunks (top_k=%d, cores=%d).",
+        chunks,
+        layer.top_k,
+        spyre_config.sencores,
+    )
     del layer.w2_weight, w2
 
     dtype = layer.spyre_moe_gate.dtype

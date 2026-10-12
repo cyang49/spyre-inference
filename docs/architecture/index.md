@@ -170,18 +170,23 @@ second weight pool.
 | `spyre_moe_down_alias` | `[E·C, M, H/C]` | `[E·C, H/(C·s), M, s]` | gathered |
 
 `s` is the stick (64 fp16 elements), `M` the intermediate dim zero-widened to whole sticks,
-and `C` is selected once during load by `_derive_moe_chunks`, using `top_k`, the configured
-core count, legal divisors of `H/s`, and a 1.5 MB per-core gathered-weight budget. For Gemma 4
-with `top_k=8` and 32 cores this selects `C=4`. `SPYRE_MOE_CHUNKS` overrides the derived
-value; the override must still split `H` into whole-stick chunks and bypasses the budget check,
-so it can cause extra spills or make compilation fail. Alias entry `e·C + c` is chunk `c` of
-expert `e`. TP narrows only `M`, so the slicing is unchanged at every TP degree.
+and `C` is selected once during load by `_derive_moe_chunks`: the smallest divisor of `H/s`
+that spreads the `top_k·C` entries over the most cores. A core then holds
+`top_k·H·M / cores` weight elements whatever `C` is, so that split also has the smallest
+per-core working set. For Gemma 4 with `top_k=8` and 32 cores this selects `C=4`.
+`SPYRE_MOE_CHUNKS` overrides the derived value; the override must still split `H` into
+whole-stick chunks. Alias entry `e·C + c` is chunk `c` of expert `e`. TP narrows only `M`, so
+the slicing is unchanged at every TP degree.
+
+Decode orders the `top_k·C` entries row-major (row, then chunk): the entry index is the widened
+expert index times `C` plus a `[1, C, 1]` offset, both device tensors made at load, so the input
+is one broadcast, the gate/up chunk sum reduces a contiguous axis and the down parts reshape
+straight into `H`. Built from per-chunk `torch.cat`s instead, the region splits into four
+kernels plus per-call constants, whose launch cost outweighs the narrower slices at TP4.
 
 The gathered form slices the hidden dim because a gather divides work only along its entries.
 Gate/up slice their contraction dim (rows of `H`); down slices its output dim (columns of `H`).
-If no automatic chunk count fits the weight budget, preparation uses C=1: the gather still
-selects only routed experts, though its working set may exceed the estimate. Persistent
-dispatch remains available for token batches above the gathered bound.
+Persistent dispatch remains available for token batches above the gathered bound.
 
 An alias is only valid when the sliced axis sits directly inside the expert axis in device
 order, so that each slice is one contiguous block and slicing merely relabels the flat order.

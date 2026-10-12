@@ -180,15 +180,7 @@ def moe_weights(request):
         stacks["gate"] = F.pad(stacks["gate"], (0, pad))
         stacks["up"] = F.pad(stacks["up"], (0, pad))
         stacks["down"] = F.pad(stacks["down"], (0, 0, 0, pad))
-    chunks = _derive_moe_chunks(
-        HIDDEN,
-        inter,
-        TOP_K,
-        stick,
-        torch.empty((), dtype=torch.float16).element_size(),
-        spyre_config.sencores,
-    )
-    assert chunks is not None
+    chunks = _derive_moe_chunks(HIDDEN, TOP_K, stick, spyre_config.sencores)
     device = {
         name: _to_spyre_expert_weight(stacks[name], (), kernel_order=False)
         for name in ("gate", "up")
@@ -579,7 +571,7 @@ def test_above_the_gathered_bound_the_all_expert_form_takes_the_batch(monkeypatc
     assert resets == [1]
 
 
-def test_single_chunk_fallback_uses_gathered_dispatch(monkeypatch):
+def test_single_chunk_layout_uses_gathered_dispatch(monkeypatch):
     calls, resets = _dispatch_recorder(monkeypatch)
     layer = _dispatch_layer("full_softmax")
     layer.spyre_moe_chunks = 1
@@ -698,6 +690,7 @@ def test_gathered_matches_dense_reference(moe_weights, chunks_override):
     from torch_spyre._inductor import config as spyre_config
 
     from spyre_inference.moe import (
+        _chunk_entry_constants,
         _chunk_pool_alias,
         _down_chunk_pool_alias,
         _moe_gathered,
@@ -716,6 +709,7 @@ def test_gathered_matches_dense_reference(moe_weights, chunks_override):
         up_alias = _chunk_pool_alias(device["up"], chunks)
         down_alias = _down_chunk_pool_alias(device["down"], chunks)
 
+    chunk_scale, chunk_offsets = _chunk_entry_constants(chunks)
     region = torch.compile(_moe_gathered, backend="inductor", fullgraph=True, dynamic=False)
     with spyre_config.patch({"frontend_pool_allocation": True}):
         actual = region(
@@ -730,6 +724,8 @@ def test_gathered_matches_dense_reference(moe_weights, chunks_override):
             logits.dtype,
             "full_softmax",
             "gelu_tanh",
+            chunk_scale=chunk_scale,
+            chunk_offsets=chunk_offsets,
         )
 
     expected = _dense_reference(
@@ -754,7 +750,19 @@ def test_gathered_rejects_whole_expert_down_pool():
 
     with pytest.raises(ValueError, match="gathered down pool"):
         _moe_gathered(
-            x, logits, gate, gate, down, 1, 4, 4, torch.float16, "full_softmax", "gelu_tanh"
+            x,
+            logits,
+            gate,
+            gate,
+            down,
+            1,
+            4,
+            4,
+            torch.float16,
+            "full_softmax",
+            "gelu_tanh",
+            chunk_scale=None,
+            chunk_offsets=None,
         )
 
 
@@ -770,6 +778,7 @@ def stick_aligned_moe_weights():
     from torch_spyre._inductor import config as spyre_config
 
     from spyre_inference.moe import (
+        _chunk_entry_constants,
         _chunk_pool_alias,
         _derive_moe_chunks,
         _down_chunk_pool_alias,
@@ -784,15 +793,7 @@ def stick_aligned_moe_weights():
     }
     host["scale"] = torch.ones(STICK_EXPERTS, dtype=torch.float16)
     stick = get_elem_in_stick(torch.float16)
-    chunks = _derive_moe_chunks(
-        HIDDEN,
-        INTER,
-        TOP_K,
-        stick,
-        torch.empty((), dtype=torch.float16).element_size(),
-        spyre_config.sencores,
-    )
-    assert chunks is not None
+    chunks = _derive_moe_chunks(HIDDEN, TOP_K, stick, spyre_config.sencores)
     device = {
         "gate": _to_spyre_expert_weight(host["gate"], ()),
         "up": _to_spyre_expert_weight(host["up"], ()),
@@ -802,6 +803,7 @@ def stick_aligned_moe_weights():
     device["gate_alias"] = _chunk_pool_alias(device["gate"], chunks)
     device["up_alias"] = _chunk_pool_alias(device["up"], chunks)
     device["chunks"] = chunks
+    device["chunk_scale"], device["chunk_offsets"] = _chunk_entry_constants(chunks)
     return host, device
 
 
@@ -837,6 +839,8 @@ def test_gathered_loop_matches_dense_reference(stick_aligned_moe_weights, num_to
         spyre_moe_regions={},
         top_k=TOP_K,
         spyre_moe_chunks=device["chunks"],
+        spyre_moe_chunk_scale=device["chunk_scale"],
+        spyre_moe_chunk_offsets=device["chunk_offsets"],
     )
 
     with warnings.catch_warnings(record=True) as caught:
@@ -1044,16 +1048,16 @@ class _RoutedExperts(torch.nn.Module):
         self.top_k = TOP_K
 
 
-def test_moe_chunk_derivation_respects_cores_sticks_and_weight_budget():
+def test_moe_chunk_derivation_takes_the_fewest_chunks_that_fill_the_most_cores():
     from spyre_inference.moe import _derive_moe_chunks
 
-    # Gemma 4: 8 experts × 4 hidden chunks fills 32 cores; each gathered weight entry is
-    # 704 × 704 fp16, below the per-core 1.5 MB working-set budget.
-    assert _derive_moe_chunks(2816, 704, 8, 64, 2, 32) == 4
+    # Gemma 4: 8 experts × 4 hidden chunks fills 32 cores.
+    assert _derive_moe_chunks(2816, 8, 64, 32) == 4
     # Five hidden sticks can use five equal chunks; no power-of-two assumption is needed.
-    assert _derive_moe_chunks(320, 128, 4, 64, 2, 32) == 5
-    # All legal chunks still leave too much selected weight on each core at top_k=16.
-    assert _derive_moe_chunks(2816, 704, 16, 64, 2, 32) is None
+    assert _derive_moe_chunks(320, 4, 64, 32) == 5
+    # Fewer cores or a larger top_k need fewer chunks; more would only stack entries per core.
+    assert _derive_moe_chunks(2816, 8, 64, 16) == 2
+    assert _derive_moe_chunks(2816, 16, 64, 32) == 2
 
 
 def test_moe_chunk_override_is_read_and_shape_validated(monkeypatch):
@@ -1062,12 +1066,12 @@ def test_moe_chunk_override_is_read_and_shape_validated(monkeypatch):
 
     monkeypatch.setenv("SPYRE_MOE_CHUNKS", "2")
     assert envs.SPYRE_MOE_CHUNKS == 2
-    assert _derive_moe_chunks(2816, 704, 8, 64, 2, 32, envs.SPYRE_MOE_CHUNKS) == 2
+    assert _derive_moe_chunks(2816, 8, 64, 32, envs.SPYRE_MOE_CHUNKS) == 2
 
     monkeypatch.setenv("SPYRE_MOE_CHUNKS", "3")
     envs.clear_env_cache()
     with pytest.raises(ValueError, match=r"SPYRE_MOE_CHUNKS=3 requires hidden size 2816"):
-        _derive_moe_chunks(2816, 704, 8, 64, 2, 32, envs.SPYRE_MOE_CHUNKS)
+        _derive_moe_chunks(2816, 8, 64, 32, envs.SPYRE_MOE_CHUNKS)
 
 
 @pytest.mark.parametrize("hidden", [HIDDEN - 1], ids=["not_stick_aligned"])
@@ -1109,25 +1113,6 @@ def test_prepare_layer_honors_chunk_override(monkeypatch):
     assert layer.spyre_moe_down_alias is not None
     assert layer.spyre_moe_gate_alias.shape == (EXPERTS * 2, HIDDEN // 2, INTER)
     assert layer.spyre_moe_down_alias.shape == (EXPERTS * 2, INTER, HIDDEN // 2)
-
-
-def test_prepare_layer_uses_c1_when_selector_returns_none(monkeypatch):
-    from spyre_inference import moe as moe_module
-    from spyre_inference.moe import SpyreMoERecipe, _prepare_layer
-
-    monkeypatch.setattr(moe_module, "_derive_moe_chunks", lambda *args, **kwargs: None)
-    layer = _RoutedExperts(
-        torch.randn(EXPERTS, 2 * INTER, HIDDEN, dtype=torch.float16),
-        torch.randn(EXPERTS, HIDDEN, INTER, dtype=torch.float16),
-    )
-    layer.spyre_moe_recipe = SpyreMoERecipe("gelu_tanh", "full_softmax")
-
-    _prepare_layer(layer)
-
-    assert layer.spyre_moe_chunks == 1
-    assert layer.spyre_moe_gate_alias.shape == (EXPERTS, HIDDEN, INTER)
-    assert layer.spyre_moe_up_alias.shape == (EXPERTS, HIDDEN, INTER)
-    assert layer.spyre_moe_down_alias.shape == (EXPERTS, INTER, HIDDEN)
 
 
 # Exercise the actual Gemma 4 TP=2 and TP=4 expert widths with the reduced test hidden size.

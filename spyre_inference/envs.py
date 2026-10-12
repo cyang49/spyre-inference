@@ -120,7 +120,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "8" (default) is measured on gemma-4-26B-A4B: gathered wins up to 8 at TP1 and TP4.
     "SPYRE_MOE_GATHERED_MAX_TOKENS": lambda: int(os.getenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "8")),
     # Override the automatically selected hidden-axis chunk count for gathered MoE. Unset
-    # derives it from top_k, stick alignment, core count, and the per-core weight budget.
+    # derives it from top_k, stick alignment and the core count.
     "SPYRE_MOE_CHUNKS": lambda: (
         int(value) if (value := os.getenv("SPYRE_MOE_CHUNKS")) is not None else None
     ),
